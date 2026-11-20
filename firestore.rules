@@ -1,0 +1,221 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Reglas de seguridad del almacén.
+//  El servidor valida TODO lo que el cliente intenta escribir:
+//   · Roles (admin / operator / viewer) y cuentas desactivadas.
+//   · Esquema y tamaños de cada campo.
+//   · Que el usuario registrado en cada movimiento sea quien realmente lo hace.
+//   · Que el stock solo cambie junto con un movimiento coherente (anterior + delta = nuevo).
+//   · Que el historial sea inmutable (no se puede editar ni borrar).
+// ─────────────────────────────────────────────────────────────────────────────
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Utilidades ──────────────────────────────────────────────────────────
+    function signedIn() { return request.auth != null; }
+    function path(col, id) { return /databases/$(database)/documents/$(col)/$(id); }
+    function me() { return get(path('users', request.auth.uid)).data; }
+    function isActive() { return signedIn() && exists(path('users', request.auth.uid)) && me().active == true; }
+    function hasRole(roles) { return isActive() && me().role in roles; }
+    function canWrite() { return hasRole(['admin', 'operator']); }
+    function isAdmin() { return hasRole(['admin']); }
+
+    function isNum(v) { return v is int || v is float; }
+    function num(v, min, max) { return isNum(v) && v >= min && v <= max; }
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function near(a, b) { return math.abs(a - b) < 0.0001; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // Referencia de usuario embebida: debe ser quien hace la petición.
+    function isMe(ref) {
+      return ref is map
+        && ref.keys().hasOnly(['uid', 'name', 'email'])
+        && ref.uid == request.auth.uid
+        && str(ref.name, 1, 60)
+        && ref.email is string;
+    }
+
+    // ── Configuración / arranque ────────────────────────────────────────────
+    match /config/{docId} {
+      allow read: if signedIn();
+      // El primer usuario que se registra se convierte en administrador (una sola vez).
+      allow create: if docId == 'setup'
+        && signedIn()
+        && request.resource.data.keys().hasOnly(['adminUid', 'createdAt'])
+        && request.resource.data.adminUid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && getAfter(path('users', request.auth.uid)).data.role == 'admin';
+      allow update, delete: if false;
+    }
+
+    // ── Usuarios ────────────────────────────────────────────────────────────
+    match /users/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid) || isActive();
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'active', 'createdAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && str(request.resource.data.displayName, 1, 60)
+        && request.resource.data.active == true
+        && request.resource.data.createdAt == request.time
+        && (
+          request.resource.data.role == 'viewer'
+          || (
+            request.resource.data.role == 'admin'
+            && !exists(path('config', 'setup'))
+            && getAfter(path('config', 'setup')).data.adminUid == uid
+          )
+        );
+
+      allow update: if
+        // Un admin cambia rol / acceso de OTRO usuario (nadie puede bloquearse a sí mismo).
+        (
+          isAdmin()
+          && request.auth.uid != uid
+          && changed().hasOnly(['role', 'active', 'updatedAt'])
+          && request.resource.data.role in ['admin', 'operator', 'viewer']
+          && request.resource.data.active is bool
+          && request.resource.data.updatedAt == request.time
+        )
+        // Cada usuario puede cambiar solo su nombre visible.
+        || (
+          signedIn()
+          && request.auth.uid == uid
+          && changed().hasOnly(['displayName', 'updatedAt'])
+          && str(request.resource.data.displayName, 2, 60)
+          && request.resource.data.updatedAt == request.time
+        );
+
+      allow delete: if false;
+    }
+
+    // ── Productos ───────────────────────────────────────────────────────────
+    function validProduct(d) {
+      return d.keys().hasOnly([
+          'sku', 'name', 'description', 'category', 'unit', 'location', 'minStock',
+          'quantity', 'archived', 'lastMovementId', 'createdBy', 'createdAt', 'updatedBy', 'updatedAt'
+        ])
+        && str(d.name, 2, 120)
+        && str(d.description, 0, 1000)
+        && str(d.category, 1, 60)
+        && d.unit in ['unidad', 'caja', 'paquete', 'kg', 'g', 'litro', 'ml', 'metro', 'rollo', 'par']
+        && str(d.location, 0, 60)
+        && num(d.minStock, 0, 1000000)
+        && num(d.quantity, 0, 10000000)
+        && d.archived is bool
+        && (d.lastMovementId == null || d.lastMovementId is string);
+    }
+
+    function movementAfter(id) { return getAfter(path('movements', id)).data; }
+
+    match /products/{productId} {
+      allow read: if isActive();
+
+      allow create: if canWrite()
+        && productId.matches('^[A-Z0-9_-]{2,40}$')
+        && validProduct(request.resource.data)
+        && request.resource.data.sku == productId
+        && request.resource.data.archived == false
+        && isMe(request.resource.data.createdBy)
+        && isMe(request.resource.data.updatedBy)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && (
+          // Sin stock inicial
+          (request.resource.data.quantity == 0 && request.resource.data.lastMovementId == null)
+          // Con stock inicial: debe venir acompañado de su movimiento de entrada
+          || (
+            request.resource.data.lastMovementId is string
+            && movementAfter(request.resource.data.lastMovementId).productId == productId
+            && movementAfter(request.resource.data.lastMovementId).previousQty == 0
+            && near(movementAfter(request.resource.data.lastMovementId).newQty, request.resource.data.quantity)
+          )
+        );
+
+      allow update: if canWrite()
+        && validProduct(request.resource.data)
+        && !changed().hasAny(['sku', 'createdBy', 'createdAt'])
+        && isMe(request.resource.data.updatedBy)
+        && request.resource.data.updatedAt == request.time
+        // Solo un admin archiva / restaura
+        && (!changed().hasAny(['archived']) || isAdmin())
+        && (
+          // Edición de datos: el stock no cambia
+          !changed().hasAny(['quantity', 'lastMovementId'])
+          // Cambio de stock: exige un movimiento NUEVO y coherente en la misma transacción
+          || (
+            resource.data.archived == false
+            && !changed().hasAny(['archived'])
+            && request.resource.data.lastMovementId is string
+            && request.resource.data.lastMovementId != resource.data.lastMovementId
+            && !exists(path('movements', request.resource.data.lastMovementId))
+            && movementAfter(request.resource.data.lastMovementId).productId == productId
+            && near(movementAfter(request.resource.data.lastMovementId).previousQty, resource.data.quantity)
+            && near(movementAfter(request.resource.data.lastMovementId).newQty, request.resource.data.quantity)
+          )
+        );
+
+      // Los productos no se borran: se archivan, para no perder la trazabilidad.
+      allow delete: if false;
+    }
+
+    // ── Movimientos (historial inmutable) ───────────────────────────────────
+    function validMovementMath(d) {
+      return near(d.newQty, d.previousQty + d.delta)
+        && (
+          (d.type == 'entrada' && d.delta > 0 && near(d.quantity, d.delta))
+          || (d.type == 'salida' && d.delta < 0 && near(d.quantity, -d.delta))
+          || (d.type == 'ajuste' && d.delta != 0 && near(d.quantity, math.abs(d.delta)))
+        );
+    }
+
+    function stockBefore(productId) {
+      return get(path('products', productId)).data.quantity;
+    }
+
+    match /movements/{movementId} {
+      allow read: if isActive();
+
+      allow create: if canWrite()
+        && request.resource.data.keys().hasOnly([
+          'productId', 'productName', 'sku', 'unit', 'type', 'quantity', 'delta',
+          'previousQty', 'newQty', 'reason', 'note', 'user', 'createdAt'
+        ])
+        && request.resource.data.productId is string
+        && request.resource.data.sku == request.resource.data.productId
+        && str(request.resource.data.productName, 1, 120)
+        && request.resource.data.unit is string
+        && request.resource.data.type in ['entrada', 'salida', 'ajuste']
+        && num(request.resource.data.quantity, 0.000001, 10000000)
+        && num(request.resource.data.delta, -10000000, 10000000)
+        && num(request.resource.data.previousQty, 0, 10000000)
+        && num(request.resource.data.newQty, 0, 10000000)
+        && str(request.resource.data.reason, 1, 80)
+        && str(request.resource.data.note, 0, 500)
+        && isMe(request.resource.data.user)
+        && request.resource.data.createdAt == request.time
+        && validMovementMath(request.resource.data)
+        // El producto, tras la transacción, apunta a este movimiento con el stock resultante
+        && getAfter(path('products', request.resource.data.productId)).data.lastMovementId == movementId
+        && near(getAfter(path('products', request.resource.data.productId)).data.quantity, request.resource.data.newQty)
+        // El stock anterior declarado es el real
+        && (
+          (!exists(path('products', request.resource.data.productId)) && request.resource.data.previousQty == 0)
+          || (
+            exists(path('products', request.resource.data.productId))
+            && near(stockBefore(request.resource.data.productId), request.resource.data.previousQty)
+          )
+        );
+
+      allow update, delete: if false;
+    }
+
+    // Cualquier otra ruta queda cerrada.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

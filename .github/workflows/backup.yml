@@ -1,0 +1,66 @@
+name: Backup Firestore
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # Todos los días a las 06:00 UTC (02:00 hora de Venezuela)
+  workflow_dispatch: # Permite lanzarlo a mano desde la pestaña "Actions"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firestore-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci --no-audit --no-fund
+
+      - name: Exportar Firestore
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "::error::Falta el secreto FIREBASE_SERVICE_ACCOUNT (Settings → Secrets and variables → Actions)."
+            exit 1
+          fi
+          node scripts/backup.mjs backup-output
+
+      - name: Subir como artefacto (90 días)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firestore-backup-${{ github.run_id }}
+          path: backup-output
+          retention-days: 90
+
+      - name: Guardar en la rama "backups"
+        # Desactívalo creando la variable de repositorio BACKUP_TO_BRANCH=false
+        if: vars.BACKUP_TO_BRANCH != 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin backups > /dev/null; then
+            git fetch --depth=1 origin backups:backups
+            git worktree add ../bk backups
+          else
+            git worktree add --orphan -b backups ../bk
+          fi
+          mkdir -p ../bk/backups
+          cp -r backup-output/* ../bk/backups/
+          cd ../bk
+          # Conserva solo los últimos 60 backups en la rama (el historial de git guarda el resto)
+          ls -1d backups/*/ | sort | head -n -60 | xargs -r rm -rf
+          git add -A
+          git commit -m "Backup Firestore $(date -u +'%Y-%m-%d %H:%M UTC')" || { echo "Sin cambios"; exit 0; }
+          git push origin backups
